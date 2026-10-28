@@ -43,14 +43,30 @@ defmodule Glific.Flows.ContactActionTest do
     contact = Contacts.get_contact!(contact.id)
     assert contact.optout_time != nil
     assert contact.optin_time == nil
-    assert %{contact: state, identity: state} = Fixtures.whatsapp_state(contact)
+    assert %{contact: state, identity: state} = Fixtures.whatsapp_optin_fields(contact)
 
     ContactAction.optin(context)
     contact = Contacts.get_contact!(contact.id)
     assert contact.optout_time == nil
     assert contact.optin_time != nil
-    assert %{contact: state, identity: state} = Fixtures.whatsapp_state(contact)
+    assert %{contact: state, identity: state} = Fixtures.whatsapp_optin_fields(contact)
     assert state.optin_status
+  end
+
+  test "an opt-out in a web flow leaves the contact's WhatsApp consent alone", attrs do
+    [contact | _] =
+      Contacts.list_contacts(%{filter: Map.merge(attrs, %{name: "Default receiver"})})
+
+    {:ok, contact} =
+      Contacts.update_contact(contact, %{optin_status: true, optin_time: DateTime.utc_now()})
+
+    context =
+      %FlowContext{contact_id: contact.id, channel: :web}
+      |> Repo.preload(:contact)
+
+    ContactAction.optout(context)
+
+    assert %Contact{optin_status: true, optout_time: nil} = Contacts.get_contact!(contact.id)
   end
 
   test "send message text", attrs do
@@ -97,7 +113,7 @@ defmodule Glific.Flows.ContactActionTest do
         channel: :web
       })
 
-    Fixtures.web_opted_in_fixture(contact)
+    Fixtures.opt_in_to_web(contact)
     context = Repo.preload(context, [:contact, :flow])
 
     ContactAction.send_message(context, %Action{text: "web reply"}, [])

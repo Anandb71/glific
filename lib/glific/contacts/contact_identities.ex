@@ -76,7 +76,7 @@ defmodule Glific.Contacts.ContactIdentities do
       multi,
       :identity,
       fn %{contact: contact} ->
-        identity_changeset(contact, channel, identifier, identity_attrs(contact, channel))
+        identity_changeset(contact, channel, identifier, contact_identity_attrs(contact, channel))
       end,
       if(channel == :whatsapp, do: whatsapp_insert_opts(), else: [])
     )
@@ -92,7 +92,7 @@ defmodule Glific.Contacts.ContactIdentities do
     case whatsapp_identity_id(contact) do
       nil ->
         contact
-        |> identity_changeset(:whatsapp, phone, identity_attrs(contact, :whatsapp))
+        |> identity_changeset(:whatsapp, phone, contact_identity_attrs(contact, :whatsapp))
         |> Repo.insert(whatsapp_insert_opts())
 
       identity_id ->
@@ -218,7 +218,11 @@ defmodule Glific.Contacts.ContactIdentities do
   """
   @spec whatsapp_changes?(changes()) :: boolean()
   def whatsapp_changes?(changes),
-    do: Enum.any?(Map.keys(changes), &(&1 == :phone or &1 in ContactIdentity.state_fields()))
+    do:
+      Enum.any?(
+        Map.keys(changes),
+        &(&1 == :phone or &1 in ContactIdentity.consent_and_session_fields())
+      )
 
   @doc """
   Bulk-inserts the WhatsApp identity, with its consent and session state, of each saved contact row.
@@ -231,7 +235,7 @@ defmodule Glific.Contacts.ContactIdentities do
     |> Stream.filter(&(is_binary(&1.phone) and &1.phone != ""))
     |> Stream.map(fn row ->
       row
-      |> identity_attrs(:whatsapp)
+      |> contact_identity_attrs(:whatsapp)
       |> Map.merge(%{
         contact_id: row.id,
         organization_id: organization_id,
@@ -343,16 +347,16 @@ defmodule Glific.Contacts.ContactIdentities do
     )
   end
 
-  @spec identity_attrs(Contact.t() | map(), MessageChannel.t()) :: map()
-  defp identity_attrs(contact, :whatsapp), do: identity_state(contact)
-  defp identity_attrs(_contact, _channel), do: %{}
+  @spec contact_identity_attrs(Contact.t() | map(), MessageChannel.t()) :: map()
+  defp contact_identity_attrs(contact, :whatsapp), do: identity_state(contact)
+  defp contact_identity_attrs(_contact, _channel), do: %{}
 
   # The identity's optin_status and bsp_status are NOT NULL. contacts.optin_status allows nil, and a
   # contact inserted without bsp_status holds nil in its struct, since Ecto does not read back the default.
   @spec identity_state(map()) :: map()
   defp identity_state(contact_or_changes) do
     contact_or_changes
-    |> Map.take(ContactIdentity.state_fields())
+    |> Map.take(ContactIdentity.consent_and_session_fields())
     |> Map.replace_lazy(:optin_status, &(&1 == true))
     |> Map.replace_lazy(:bsp_status, &(&1 || :none))
   end
