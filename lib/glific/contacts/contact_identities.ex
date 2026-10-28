@@ -76,63 +76,70 @@ defmodule Glific.Contacts.ContactIdentities do
       multi,
       :identity,
       fn %{contact: contact} ->
-        identity_changeset(contact, channel, identifier, state_attrs(contact, channel))
+        identity_changeset(contact, channel, identifier, identity_attrs(contact, channel))
       end,
-      identity_insert_opts(channel)
+      if(channel == :whatsapp, do: whatsapp_insert_opts(), else: [])
     )
   end
 
   @doc """
-  Keeps the contact's WhatsApp identity in step after `changes`: follows a new phone, else updates an existing identity.
+  Moves the contact's WhatsApp identity to its current phone, creating one when it has none.
   """
-  @spec sync_whatsapp_identity(Contact.t(), changes()) :: :ok
-  def sync_whatsapp_identity(%Contact{phone: phone}, _changes) when phone in [nil, ""], do: :ok
+  @spec move_whatsapp_identity_to_phone(Contact.t()) :: :ok
+  def move_whatsapp_identity_to_phone(%Contact{phone: phone}) when phone in [nil, ""], do: :ok
 
-  def sync_whatsapp_identity(contact, changes) do
-    if Map.has_key?(changes, :phone), do: set_whatsapp_identity(contact)
-    update_whatsapp_identity(contact, changes)
-  end
-
-  @spec set_whatsapp_identity(Contact.t()) :: :ok
-  defp set_whatsapp_identity(%Contact{id: contact_id, phone: phone} = contact) do
-    delete_stale_whatsapp_identities(contact)
-
-    case current_whatsapp_identity_id(contact) do
+  def move_whatsapp_identity_to_phone(%Contact{phone: phone} = contact) do
+    case whatsapp_identity_id(contact) do
       nil ->
         contact
-        |> identity_changeset(:whatsapp, phone, state_attrs(contact, :whatsapp))
+        |> identity_changeset(:whatsapp, phone, identity_attrs(contact, :whatsapp))
         |> Repo.insert(whatsapp_insert_opts())
 
       identity_id ->
-        from(i in ContactIdentity,
-          where: i.channel == :whatsapp and i.contact_id == ^contact_id and i.id != ^identity_id
-        )
-        |> Repo.delete_all()
-
-        from(i in ContactIdentity, where: i.id == ^identity_id)
-        |> Repo.update_all(set: [identifier: phone, updated_at: DateTime.utc_now()])
+        rename_whatsapp_identity(identity_id, contact)
     end
 
     :ok
   end
 
-  @spec current_whatsapp_identity_id(Contact.t()) :: non_neg_integer() | nil
-  defp current_whatsapp_identity_id(%Contact{id: contact_id, phone: phone}) do
+  @spec whatsapp_identity_id(Contact.t()) :: non_neg_integer() | nil
+  defp whatsapp_identity_id(%Contact{id: contact_id}) do
     from(i in ContactIdentity,
       where: i.channel == :whatsapp and i.contact_id == ^contact_id,
-      order_by: [desc: i.identifier == ^phone, desc: i.id],
       limit: 1,
       select: i.id
     )
     |> Repo.one()
   end
 
-  @spec update_whatsapp_identity(Contact.t(), changes()) :: :ok
-  defp update_whatsapp_identity(%Contact{id: contact_id, phone: phone}, changes) do
+  # A number another identity already holds is left alone rather than raising on the unique index.
+  @spec rename_whatsapp_identity(non_neg_integer(), Contact.t()) :: {non_neg_integer(), nil}
+  defp rename_whatsapp_identity(identity_id, %Contact{
+         organization_id: organization_id,
+         phone: phone
+       }) do
+    taken =
+      from(i in ContactIdentity,
+        where:
+          i.organization_id == ^organization_id and i.channel == :whatsapp and
+            i.identifier == ^phone and i.id != ^identity_id
+      )
+
+    from(i in ContactIdentity, where: i.id == ^identity_id and not exists(subquery(taken)))
+    |> Repo.update_all(set: [identifier: phone, updated_at: DateTime.utc_now()])
+  end
+
+  @doc """
+  Copies the consent and session fields among `changes` onto the contact's WhatsApp identity, if it has one.
+  """
+  @spec copy_state_to_whatsapp_identity(Contact.t(), changes()) :: :ok
+  def copy_state_to_whatsapp_identity(%Contact{phone: phone}, _changes) when phone in [nil, ""],
+    do: :ok
+
+  def copy_state_to_whatsapp_identity(%Contact{id: contact_id, phone: phone}, changes) do
     set =
       changes
-      |> Map.take(ContactIdentity.state_fields())
-      |> not_null_state()
+      |> identity_state()
       |> Map.put(:updated_at, DateTime.utc_now())
 
     from(i in ContactIdentity,
@@ -167,9 +174,9 @@ defmodule Glific.Contacts.ContactIdentities do
   @doc """
   Records opt-in on the contact's identity on `channel` unless it is already opted in.
   """
-  @spec record_optin(Contact.t(), MessageChannel.t(), String.t(), DateTime.t(), String.t()) ::
+  @spec record_optin(non_neg_integer(), MessageChannel.t(), String.t(), DateTime.t(), String.t()) ::
           :recorded | :already_opted_in
-  def record_optin(%Contact{id: contact_id}, channel, identifier, utc_time, method) do
+  def record_optin(contact_id, channel, identifier, utc_time, method) do
     identifier = lookup_key(channel, identifier)
 
     # In the UPDATE itself rather than a read before it, so two concurrent sign-ins cannot both record.
@@ -213,22 +220,6 @@ defmodule Glific.Contacts.ContactIdentities do
   def whatsapp_changes?(changes),
     do: Enum.any?(Map.keys(changes), &(&1 == :phone or &1 in ContactIdentity.state_fields()))
 
-  @spec delete_stale_whatsapp_identities(Contact.t()) :: non_neg_integer()
-  defp delete_stale_whatsapp_identities(%Contact{id: contact_id, phone: phone}) do
-    stale_ids =
-      from(i in ContactIdentity,
-        join: c in assoc(i, :contact),
-        where: i.channel == :whatsapp and i.identifier == ^phone and i.contact_id != ^contact_id,
-        where: is_nil(c.phone) or c.phone != ^phone,
-        select: i.id
-      )
-
-    {deleted, _rows} =
-      Repo.delete_all(from(i in ContactIdentity, where: i.id in subquery(stale_ids)))
-
-    deleted
-  end
-
   @doc """
   Bulk-inserts the WhatsApp identity, with its consent and session state, of each saved contact row.
   """
@@ -240,7 +231,7 @@ defmodule Glific.Contacts.ContactIdentities do
     |> Stream.filter(&(is_binary(&1.phone) and &1.phone != ""))
     |> Stream.map(fn row ->
       row
-      |> state_attrs(:whatsapp)
+      |> identity_attrs(:whatsapp)
       |> Map.merge(%{
         contact_id: row.id,
         organization_id: organization_id,
@@ -352,33 +343,22 @@ defmodule Glific.Contacts.ContactIdentities do
     )
   end
 
-  @spec state_attrs(Contact.t() | map(), MessageChannel.t()) :: map()
-  defp state_attrs(contact, :whatsapp) do
-    contact
+  @spec identity_attrs(Contact.t() | map(), MessageChannel.t()) :: map()
+  defp identity_attrs(contact, :whatsapp), do: identity_state(contact)
+  defp identity_attrs(_contact, _channel), do: %{}
+
+  # The identity's optin_status and bsp_status are NOT NULL. contacts.optin_status allows nil, and a
+  # contact inserted without bsp_status holds nil in its struct, since Ecto does not read back the default.
+  @spec identity_state(map()) :: map()
+  defp identity_state(contact_or_changes) do
+    contact_or_changes
     |> Map.take(ContactIdentity.state_fields())
-    |> not_null_state()
+    |> Map.replace_lazy(:optin_status, &(&1 == true))
+    |> Map.replace_lazy(:bsp_status, &(&1 || :none))
   end
 
-  defp state_attrs(_contact, _channel), do: %{}
-
-  # The contact's columns allow nil here; the identity's are NOT NULL.
-  @spec not_null_state(map()) :: map()
-  defp not_null_state(state) do
-    state
-    |> update_present(:optin_status, &(&1 == true))
-    |> update_present(:bsp_status, &(&1 || :none))
-  end
-
-  @spec update_present(map(), atom(), (any() -> any())) :: map()
-  defp update_present(map, key, fun) when is_map_key(map, key), do: Map.update!(map, key, fun)
-  defp update_present(map, _key, _fun), do: map
-
-  @spec identity_insert_opts(MessageChannel.t()) :: keyword()
-  defp identity_insert_opts(:whatsapp), do: whatsapp_insert_opts()
-  defp identity_insert_opts(_channel), do: []
-
-  @spec whatsapp_insert_opts() :: keyword()
   # allow_stale: a conflicting row another contact holds updates nothing, which Ecto would raise as stale.
+  @spec whatsapp_insert_opts() :: keyword()
   defp whatsapp_insert_opts,
     do: [
       on_conflict: replace_state_of_same_contact(),
